@@ -1,0 +1,9 @@
+# Google Cloud
+service-account-key.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Environment
+.env
