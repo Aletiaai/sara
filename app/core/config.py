@@ -2,41 +2,43 @@
 
 import os
 from pydantic_settings import BaseSettings
-from pydantic import Field
 from pathlib import Path
 
-# This allows me to reliably locate files like 'service-account-key.json'
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
-
 class Settings(BaseSettings):
-    """Application settings loaded from environment variables. Pydantic's BaseSettings automatically reads from a .env file."""
+    """
+    Application settings loaded from environment variables.
+    This class now assumes that the .env file has already been loaded
+    into the process's environment by main.py.
+    """
     # --- Google Cloud ---
-    GCP_PROJECT_ID: str = Field(..., env="GCP_PROJECT_ID")
-    GOOGLE_APPLICATION_CREDENTIALS: str = Field(..., env="GOOGLE_APPLICATION_CREDENTIALS")
+    GCP_PROJECT_ID: str
+    GOOGLE_APPLICATION_CREDENTIALS: str
 
     # --- Document AI ---
-    DOCUMENT_AI_PROCESSOR_ID: str = Field(..., env="DOCUMENT_AI_PROCESSOR_ID")
-    DOCUMENT_AI_LOCATION: str = Field("us", env="DOCUMENT_AI_LOCATION")
+    DOCUMENT_AI_PROCESSOR_ID: str
+    DOCUMENT_AI_LOCATION: str = "us"
 
     # --- Vertex AI ---
-    VERTEX_AI_REGION: str = Field("us-central1", env="VERTEX_AI_REGION")
-    VECTOR_SEARCH_INDEX_ID: str = Field(..., env="VECTOR_SEARCH_INDEX_ID")
-    VECTOR_SEARCH_ENDPOINT_ID: str = Field(..., env="VECTOR_SEARCH_ENDPOINT_ID")
+    VERTEX_AI_REGION: str = "us-central1"
+    VECTOR_SEARCH_INDEX_ID: str
+    VECTOR_SEARCH_ENDPOINT_ID: str
 
-    # --- WhatsApp ---
-    WHATSAPP_API_TOKEN: str = Field(..., env="WHATSAPP_API_TOKEN")
-    WHATSAPP_PHONE_NUMBER_ID: str = Field(..., env="WHATSAPP_PHONE_NUMBER_ID")
-    WHATSAPP_VERIFY_TOKEN: str = Field(..., env="WHATSAPP_VERIFY_TOKEN")
+    # --- Twilio ---
+    TWILIO_ACCOUNT_SID: str = ""
+    TWILIO_AUTH_TOKEN: str = ""
+    TWILIO_PHONE_NUMBER: str = ""
 
+    # --- Provider Selection ---
+    WHATSAPP_PROVIDER: str = "meta"
 
     class Config:
-        """Pydantic settings configuration. Specifies the location of the .env file."""
-        env_file = os.path.join(BASE_DIR, ".env")
-        env_file_encoding = 'utf-8'
+        # Pydantic will read from the environment variables, case-insensitively.
+        case_sensitive = False
 
-
-# Create a single, importable instance of the settings
+# This line reads the environment variables and creates the settings object.
 settings = Settings()
 
-# Google Cloud client libraries automatically use this variable.
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(BASE_DIR, settings.GOOGLE_APPLICATION_CREDENTIALS)
+# This part is still necessary to tell the Google libraries where to find the key file.
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+credentials_path = BASE_DIR / settings.GOOGLE_APPLICATION_CREDENTIALS
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(credentials_path)
