@@ -1,16 +1,11 @@
 # app/main.py
 
 # --- ENVIRONMENT LOADING (MUST BE FIRST) ---
-# This block is the definitive fix. It runs before anything else.
 import os
 import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
-print("--- SARA Legal Assistant: Starting Application ---")
-
-# We start from the current working directory, where you run `python -m app.main`.
-# This is the most reliable way to find the .env file in your project root.
 current_path = Path.cwd()
 ENV_PATH = current_path / ".env"
 
@@ -42,7 +37,7 @@ from twilio.request_validator import RequestValidator
 from app.core.config import settings
 from app.services import rag_service
 
-# --- Dynamic Service Loading (will now work correctly) ---
+# --- Dynamic Service Loading ---
 if settings.WHATSAPP_PROVIDER.lower() == "twilio":
     from app.services import whatsapp_service_t as whatsapp_service
     PROVIDER = "twilio"
@@ -70,6 +65,7 @@ if PROVIDER == "twilio":
 # --- Webhook Endpoints ---
 @app.post("/webhook")
 async def receive_message(request: Request, background_tasks: BackgroundTasks, x_twilio_signature: str = Header(None)):
+    """ Single webhook endpoint that routes all incoming WhatsApp events."""
     logger.info(f"Webhook received. Application running with PROVIDER: '{PROVIDER}'")
     if PROVIDER == "twilio":
         logger.info("Processing as Twilio request.")
@@ -81,9 +77,17 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks, x
             group_id = form_data.get("From")
             num_media = int(form_data.get("NumMedia", 0))
             if num_media > 0:
+                # This is a document message
                 media_url = form_data.get("MediaUrl0")
                 mime_type = form_data.get("MediaContentType0")
                 background_tasks.add_task(handle_document_message, media_url, mime_type, group_id)
+            else:
+                # This is a text message
+                text_content = form_data.get("Body", "").strip()
+                if text_content.lower().startswith("@sara"):
+                    question = text_content[5:].strip() # Remove "@sara"
+                    background_tasks.add_task(handle_text_message, question, group_id)
+                    
             return Response(content="", media_type="text/xml")
         except Exception as e:
             logger.error(f"Error processing Twilio form data: {e}", exc_info=True)
@@ -108,6 +112,12 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks, x
                 mime_type = document_info["mime_type"]
                 if mime_type in ["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
                     background_tasks.add_task(handle_document_message, media_id, mime_type, group_id)
+            elif message_type == "text":
+                text_content = message_data["text"]["body"].strip()
+                if text_content.lower().startswith("@sara"):
+                    question = text_content[5:].strip() # Remove "@sara"
+                    background_tasks.add_task(handle_text_message, question, group_id)
+
             return Response(status_code=200)
         except json.JSONDecodeError:
             logger.error("JSONDecodeError: This is a Twilio request but the app is running in 'meta' mode. Check .env file.")
@@ -142,6 +152,16 @@ async def handle_document_message(media_identifier: str, mime_type: str, group_i
             rag_service.ingest_document(local_path, mime_type, group_id, doc_id)
         else:
             logger.error(f"Failed to download media from URL for group {group_id}")
+
+async def handle_text_message(question: str, group_id: str):
+    """New background task to handle question answering."""
+    logger.info(f"Handling question in background for group: {group_id}")
+    
+    # 1. Get the answer from our RAG service
+    answer = rag_service.answer_question(question, group_id)
+    
+    # 2. Send the answer back to the WhatsApp group
+    whatsapp_service.send_whatsapp_message(to=group_id, message_text=answer)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
