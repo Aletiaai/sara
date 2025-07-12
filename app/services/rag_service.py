@@ -2,9 +2,11 @@
 
 import logging
 import uuid
+import re
 from typing import List, Tuple, Dict
 from pathlib import Path
 import time
+from datetime import datetime
 
 import vertexai
 from vertexai.language_models import TextEmbeddingModel
@@ -18,11 +20,6 @@ from app.core.prompts import RAG_PROMPT_TEMPLATE
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Text Processing Configuration ---
-CHUNK_SIZE = 1024
-CHUNK_OVERLAP = 100
-
-
 # --- Client Initializations ---
 vertexai.init(project=settings.GCP_PROJECT_ID, location=settings.VERTEX_AI_REGION)
 embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
@@ -32,9 +29,65 @@ firestore_client = firestore.Client(project=settings.GCP_PROJECT_ID)
 GROUP_INDEX_COLLECTION = "sara_group_indexes"
 CHUNK_COLLECTION = "sara_document_chunks"
 
+# ==============================================================================
+# --- NEW: Metadata Extraction and Smart Chunking ---
+# ==============================================================================
+
+def extract_metadata_and_chunk(full_text: str, file_name: str) -> Tuple[Dict, List[str]]:
+    """
+    Analyzes the full text of a document to extract key metadata and splits the content into logical paragraph-based chunks.
+    Args:
+        full_text (str): The complete text content from Document AI.
+        file_name (str): The original name of the uploaded file.
+    Returns:
+        A tuple containing:
+        - A dictionary of extracted metadata.
+        - A list of text chunks (paragraphs).
+    """
+    metadata = {"original_file_name": file_name}
+    lines = full_text.split('\n')
+    
+    # Simple classification logic: check for keywords. We can make this much more sophisticated later.
+    if "secretario de acuerdos" in full_text.lower():
+        metadata["document_type"] = "Judge Response"
+        # Extract metadata for Judge's document. Case Number (top right)
+        match = re.search(r"EXPEDIENTE NÚMERO: (\S+)", full_text, re.IGNORECASE)
+        if match: metadata["case_number"] = match.group(1)
+        # Date (usually near the top)
+        match = re.search(r"(\w+,\s*\d+\s+de\s+\w+\s+de\s+\d{4})", full_text)
+        if match: metadata["document_date"] = match.group(1)
+        # Judge Name (near the signature)
+        match = re.search(r"JUEZ\s+([A-Z\sÁÉÍÓÚÑ]+)", full_text, re.IGNORECASE)
+        if match: metadata["judge_name"] = match.group(1).strip()
+
+    else:
+        metadata["document_type"] = "Lawyer Submission"
+        # Extract metadata for Lawyer's document
+        if lines:
+            metadata["case_number"] = lines[0] # Assuming first line is case number
+            metadata["judge_info"] = lines[1] # Assuming second line is judge info
+        # Client Name (near the end)
+        # This is a simple heuristic; can be improved
+        last_lines = lines[-5:]
+        for line in reversed(last_lines):
+            if "C." in line or "c." in line:
+                metadata["client_name"] = line.strip()
+                break
+    
+    # --- Smart Chunking ---
+    # Split the document into paragraphs based on double newlines.
+    # We also filter out very short "chunks" that are likely just whitespace or headings.
+    paragraphs = full_text.split('\n\n')
+    chunks = [p.strip() for p in paragraphs if len(p.strip()) > 100] # Only keep substantial paragraphs
+    
+    logger.info(f"Identified document as '{metadata.get('document_type', 'Unknown')}'. Extracted metadata: {metadata}")
+    logger.info(f"Split document into {len(chunks)} paragraph-based chunks.")
+    
+    return metadata, chunks
+
 
 # ==============================================================================
-# --- NEW: Index and Endpoint Management ---
+# --- Index and Endpoint Management ---
 # ==============================================================================
 
 def get_or_create_group_resources(group_id: str) -> Dict[str, str]:
@@ -113,96 +166,109 @@ def get_or_create_group_resources(group_id: str) -> Dict[str, str]:
 # ==============================================================================
 
 def ingest_document(file_path: Path, mime_type: str, group_id: str, doc_id: str):
-    logger.info(f"--- Starting ingestion for doc_id: {doc_id} in group: {group_id} ---")
+    logger.info(f"--- Starting ADVANCED ingestion for doc_id: {doc_id} in group: {group_id} ---")
     
-    # 1. Get the dedicated resources for this group (create if they don't exist)
     resources = get_or_create_group_resources(group_id)
     if not resources:
-        logger.error(f"Could not retrieve or create resources for group {group_id}. Aborting ingestion.")
-        return
+        logger.error("Could not retrieve or create resources. Aborting."); return
 
-    # 2. Process the document to get text
     full_text = process_document(file_path, mime_type)
     if not full_text:
         logger.error("Ingestion failed: Could not extract text."); return
 
-    # 3. Chunk, embed, and prepare data
-    text_chunks = chunk_text(full_text)
-    # The chunk_id no longer needs the group_id prefix, as the index is dedicated.
+    # 1. Extract metadata and smart chunks
+    metadata, text_chunks = extract_metadata_and_chunk(full_text, file_path.name)
+    
+    if not text_chunks:
+        logger.warning("No substantial text chunks found after smart chunking. Aborting ingestion.")
+        return
+
+    # 2. Prepare data for storage
     chunk_ids = [f"{doc_id}::{i}" for i, _ in enumerate(text_chunks)]
     embeddings = get_embeddings(text_chunks)
     if not embeddings:
         logger.error("Ingestion failed: Could not generate embeddings."); return
         
-    # Prepare data for upserting into the specific index
-    datapoints = [{"datapoint_id": id, "feature_vector": vec} for id, vec in zip(chunk_ids, embeddings)]
+    vector_datapoints = [{"datapoint_id": id, "feature_vector": vec} for id, vec in zip(chunk_ids, embeddings)]
     
-    # Also prepare the text chunks for storage in Firestore
-    firestore_data = [{"id": id, "text": chunk} for id, chunk in zip(chunk_ids, text_chunks)]
-
     try:
-        # 4. Upsert vectors to the group's dedicated index
+        # 3. Upsert vectors to the group's dedicated index
         index = aiplatform.MatchingEngineIndex(index_name=resources["index_id"])
-        index.upsert_datapoints(datapoints=datapoints)
-        logger.info(f"Successfully upserted {len(datapoints)} vectors to index {resources['index_id']}.")
+        index.upsert_datapoints(datapoints=vector_datapoints)
+        logger.info(f"Successfully upserted {len(vector_datapoints)} vectors.")
 
-        # 5. Store the text chunks in Firestore for later retrieval
+        # 4. Store the text chunks AND their metadata in Firestore
         firestore_batch = firestore_client.batch()
-        for data in firestore_data:
-            doc_ref = firestore_client.collection(CHUNK_COLLECTION).document(data["id"])
-            firestore_batch.set(doc_ref, {"text": data["text"]})
+        for i, chunk_text in enumerate(text_chunks):
+            chunk_id = chunk_ids[i]
+            doc_ref = firestore_client.collection(CHUNK_COLLECTION).document(chunk_id)
+            # Create a rich document in Firestore
+            firestore_doc = {
+                "text": chunk_text,
+                "document_id": doc_id,
+                "group_id": group_id,
+                "chunk_number": i + 1,
+                **metadata  # Add all extracted metadata to each chunk document
+            }
+            firestore_batch.set(doc_ref, firestore_doc)
         firestore_batch.commit()
-        logger.info(f"Successfully stored {len(firestore_data)} text chunks in Firestore.")
+        logger.info(f"Successfully stored {len(text_chunks)} rich chunks in Firestore.")
 
-        logger.info(f"--- ✅ ✅ ✅ Ingestion pipeline for doc_id: {doc_id} COMPLETED ---")
+        logger.info(f"--- ✅ ✅ ✅ Advanced ingestion for doc_id: {doc_id} COMPLETED ---")
 
     except Exception as e:
-        logger.error(f"--- ❌ ❌ ❌ Ingestion pipeline for doc_id: {doc_id} FAILED during upsert. ---", exc_info=True)
-
+        logger.error(f"--- ❌ ❌ ❌ Ingestion pipeline FAILED during upsert. ---", exc_info=True)
 
 def answer_question(question: str, group_id: str) -> str:
     logger.info(f"--- Answering question for group: {group_id} ---")
     
-    # 1. Get the dedicated resources for this group
     resources = get_or_create_group_resources(group_id)
     if not resources:
-        # This can happen if the group has never uploaded a document.
         return "Disculpa, necesito que compartas al menos un documento en este grupo antes de que pueda responder preguntas."
 
-    # 2. Create an embedding for the user's question
     logger.info(f"Original question: '{question}'")
     question_embedding = get_embeddings([question])[0]
     if not question_embedding:
         return "Disculpa, no pude procesar la pregunta."
         
     try:
-        # 3. Query the group's dedicated endpoint
         endpoint = aiplatform.MatchingEngineIndexEndpoint(resources["endpoint_id"])
+        
         neighbor_results = endpoint.find_neighbors(
             queries=[question_embedding],
             deployed_index_id=resources["deployed_index_id"],
-            num_neighbors=3
+            num_neighbors=5 # Let's retrieve a few more chunks to have more context
         )
         logger.info("Successfully found neighbors in Vector Search.")
         
-        # 4. Retrieve the text chunks from Firestore using the neighbor IDs
-        neighbor_ids = []
-        if neighbor_results and neighbor_results[0]:
-            for neighbor in neighbor_results[0]:
-                neighbor_ids.append(neighbor.id)
+        neighbor_ids = [neighbor.id for r in neighbor_results for neighbor in r]
         
         if not neighbor_ids:
             logger.warning("Vector search returned no neighbors.");
             return "Disculpa, la información que tengo no es suficiente para responder tu pregunta."
 
+        # Retrieve the rich documents from Firestore
         doc_refs = [firestore_client.collection(CHUNK_COLLECTION).document(id) for id in neighbor_ids]
         docs = firestore_client.get_all(doc_refs)
         
-        context_chunks = [doc.to_dict().get("text", "") for doc in docs if doc.exists]
-        context = "\n---\n".join(context_chunks)
-        logger.info(f"Retrieved {len(context_chunks)} text chunks from Firestore.")
+        # Build a richer context string that includes metadata
+        context_parts = []
+        for doc in docs:
+            if doc.exists:
+                doc_data = doc.to_dict()
+                context_str = (
+                    f"Fragmento del documento '{doc_data.get('original_file_name', 'N/A')}' "
+                    f"(Expediente: {doc_data.get('case_number', 'N/A')}, "
+                    f"Fecha: {doc_data.get('document_date', 'N/A')}):\n"
+                    f"'{doc_data.get('text', '')}'"
+                )
+                context_parts.append(context_str)
+
+        context = "\n\n---\n\n".join(context_parts)
         
-        # 5. Ask the LLM to generate an answer
+        logger.info(f"Retrieved {len(context_parts)} rich chunks. Passing the following CONTEXT to the LLM:")
+        logger.info(f"\n--- BEGIN CONTEXT ---\n{context}\n--- END CONTEXT ---")
+        
         final_answer = ask_llm(question, context)
         
         logger.info(f"Final answer: '{final_answer}'")
@@ -211,7 +277,6 @@ def answer_question(question: str, group_id: str) -> str:
     except Exception as e:
         logger.error(f"Error during query or generation for group {group_id}: {e}", exc_info=True)
         return "Disculpa, ocurrió un error al buscar la respuesta."
-
 
 # ==============================================================================
 # --- Helper Functions (Unchanged) ---
@@ -233,18 +298,6 @@ def process_document(file_path: Path, mime_type: str) -> str:
     except Exception as e:
         logger.error(f"Error processing document with Document AI: {e}", exc_info=True)
         return ""
-
-def chunk_text(text: str) -> List[str]:
-    # This function is correct and unchanged.
-    logger.info(f"Chunking text of length {len(text)}...")
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + CHUNK_SIZE
-        chunks.append(text[start:end])
-        start += CHUNK_SIZE - CHUNK_OVERLAP
-    logger.info(f"Created {len(chunks)} chunks.")
-    return chunks
 
 def get_embeddings(texts: List[str]) -> List[List[float]]:
     # This function is correct and unchanged.

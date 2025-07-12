@@ -7,8 +7,8 @@ from pathlib import Path
 class Settings(BaseSettings):
     """
     Application settings loaded from environment variables.
-    This class now assumes that the .env file has already been loaded
-    into the process's environment by main.py.
+    This class now assumes that the .env file and all necessary
+    environment variables have already been loaded by main.py.
     """
     # --- Google Cloud ---
     GCP_PROJECT_ID: str
@@ -20,8 +20,6 @@ class Settings(BaseSettings):
 
     # --- Vertex AI ---
     VERTEX_AI_REGION: str = "us-central1"
-    VECTOR_SEARCH_INDEX_ID: str
-    VECTOR_SEARCH_ENDPOINT_ID: str
 
     # --- Twilio ---
     TWILIO_ACCOUNT_SID: str = ""
@@ -37,8 +35,3 @@ class Settings(BaseSettings):
 
 # This line reads the environment variables and creates the settings object.
 settings = Settings()
-
-# This part is still necessary to tell the Google libraries where to find the key file.
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
-credentials_path = BASE_DIR / settings.GOOGLE_APPLICATION_CREDENTIALS
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(credentials_path)

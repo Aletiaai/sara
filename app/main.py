@@ -6,6 +6,9 @@ import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
+print("--- SARA Legal Assistant: Starting Application ---")
+
+# Find the project root and load the .env file
 current_path = Path.cwd()
 ENV_PATH = current_path / ".env"
 
@@ -14,7 +17,21 @@ if not ENV_PATH.exists():
     print(f"Please ensure you are running the command from the root 'sara/' directory.")
     sys.exit(1) # Exit the program with an error code.
 
-load_dotenv(dotenv_path=ENV_PATH)
+load_dotenv(dotenv_path=ENV_PATH, override=True)
+
+key_file_name = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+if not key_file_name:
+    print("FATAL ERROR: GOOGLE_APPLICATION_CREDENTIALS not set in .env file.")
+    sys.exit(1)
+
+key_file_path = current_path / key_file_name
+if not key_file_path.exists():
+    print(f"FATAL ERROR: Service account key file not found at '{key_file_path}'.")
+    sys.exit(1)
+
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(key_file_path)
+
+print(f"SUCCESS: .env loaded. Using credentials from '{key_file_path}'.")
 
 # --- DEBUGGING: Prove that the variable is loaded correctly ---
 provider_from_env = os.getenv("WHATSAPP_PROVIDER")
