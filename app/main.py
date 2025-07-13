@@ -8,15 +8,14 @@ from dotenv import load_dotenv
 
 print("--- SARA Legal Assistant: Starting Application ---")
 
-# Find the project root and load the .env file
 current_path = Path.cwd()
 ENV_PATH = current_path / ".env"
 
 if not ENV_PATH.exists():
     print(f"FATAL ERROR: Could not find the .env file at '{ENV_PATH}'.")
-    print(f"Please ensure you are running the command from the root 'sara/' directory.")
-    sys.exit(1) # Exit the program with an error code.
+    sys.exit(1) 
 
+# Your fix is the correct and robust way to handle this.
 load_dotenv(dotenv_path=ENV_PATH, override=True)
 
 key_file_name = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -30,18 +29,10 @@ if not key_file_path.exists():
     sys.exit(1)
 
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(key_file_path)
-
 print(f"SUCCESS: .env loaded. Using credentials from '{key_file_path}'.")
 
-# --- DEBUGGING: Prove that the variable is loaded correctly ---
-provider_from_env = os.getenv("WHATSAPP_PROVIDER")
-print(f"SUCCESS: .env file loaded from '{ENV_PATH}'")
-print(f"VALUE CHECK: WHATSAPP_PROVIDER is set to '{provider_from_env}'")
-if not provider_from_env:
-    print("FATAL ERROR: WHATSAPP_PROVIDER is not set in your .env file!")
-    sys.exit(1)
 
-# --- Now, and only now, we import the rest of the application ---
+# --- REGULAR APPLICATION IMPORTS ---
 import logging
 import json
 import uuid
@@ -56,7 +47,9 @@ from app.services import rag_service
 
 # --- Dynamic Service Loading ---
 if settings.WHATSAPP_PROVIDER.lower() == "twilio":
+    # Import the new functions in addition to the service module itself
     from app.services import whatsapp_service_t as whatsapp_service
+    from app.services.whatsapp_service_t import extract_filename_from_message, generate_smart_filename
     PROVIDER = "twilio"
 else:
     from app.services import whatsapp_service_vn as whatsapp_service
@@ -84,6 +77,7 @@ if PROVIDER == "twilio":
 async def receive_message(request: Request, background_tasks: BackgroundTasks, x_twilio_signature: str = Header(None)):
     """ Single webhook endpoint that routes all incoming WhatsApp events."""
     logger.info(f"Webhook received. Application running with PROVIDER: '{PROVIDER}'")
+    
     if PROVIDER == "twilio":
         logger.info("Processing as Twilio request.")
         try:
@@ -91,16 +85,21 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks, x
             if not twilio_validator.validate(str(request.url), form_data, x_twilio_signature):
                 logger.warning("Twilio request validation failed.")
                 raise HTTPException(status_code=403, detail="Invalid Twilio signature.")
+            
             group_id = form_data.get("From")
             num_media = int(form_data.get("NumMedia", 0))
+            message_body = form_data.get("Body", "") # Get the text caption
+
             if num_media > 0:
                 # This is a document message
                 media_url = form_data.get("MediaUrl0")
                 mime_type = form_data.get("MediaContentType0")
-                background_tasks.add_task(handle_document_message, media_url, mime_type, group_id)
+                # Pass the message_body to the background task
+                background_tasks.add_task(handle_document_message, media_url, mime_type, group_id, message_body)
+                
             else:
                 # This is a text message
-                text_content = form_data.get("Body", "").strip()
+                text_content = message_body.strip()
                 if text_content.lower().startswith("@sara"):
                     question = text_content[5:].strip() # Remove "@sara"
                     background_tasks.add_task(handle_text_message, question, group_id)
@@ -109,26 +108,35 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks, x
         except Exception as e:
             logger.error(f"Error processing Twilio form data: {e}", exc_info=True)
             raise HTTPException(status_code=400, detail="Could not process form data.")
+    
     else: # Meta Provider Logic
         logger.info("Processing as Meta request.")
         try:
             data = await request.json()
             entry = data.get("entry", [])
             if not entry: return Response(status_code=200)
+
             changes = entry[0].get("changes", [])
             if not changes: return Response(status_code=200)
+            
             value = changes[0].get("value", {})
             messages = value.get("messages", [])
             if not messages: return Response(status_code=200)
+
             message_data = messages[0]
             group_id = message_data["from"]
             message_type = message_data["type"]
+
             if message_type == "document":
                 document_info = message_data["document"]
                 media_id = document_info["id"]
                 mime_type = document_info["mime_type"]
+                # Meta API doesn't reliably provide a filename in the payload, but we can pass the caption if it exists.
+                message_body = document_info.get("caption", "")
+                
                 if mime_type in ["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
-                    background_tasks.add_task(handle_document_message, media_id, mime_type, group_id)
+                    background_tasks.add_task(handle_document_message, media_id, mime_type, group_id, message_body)
+            
             elif message_type == "text":
                 text_content = message_data["text"]["body"].strip()
                 if text_content.lower().startswith("@sara"):
@@ -140,8 +148,10 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks, x
             logger.error("JSONDecodeError: This is a Twilio request but the app is running in 'meta' mode. Check .env file.")
             raise HTTPException(status_code=400, detail="Invalid JSON format for Meta provider.")
 
+
 @app.get("/webhook")
 async def verify_webhook(request: Request):
+    """ Handles the one-time webhook verification for the Meta provider. """
     if PROVIDER == "meta":
         verification_result = whatsapp_service.verify_webhook(request.query_params)
         if isinstance(verification_result, str):
@@ -150,38 +160,61 @@ async def verify_webhook(request: Request):
             raise HTTPException(status_code=403, detail="Webhook verification failed.")
     return Response(content="Endpoint only used for Meta verification.", status_code=200)
 
-async def handle_document_message(media_identifier: str, mime_type: str, group_id: str):
+
+# --- Background Task Handlers ---
+
+async def handle_document_message(media_identifier: str, mime_type: str, group_id: str, message_body: str = ""):
+    """
+    Handles document ingestion, now with logic to determine the original filename.
+    """
     logger.info(f"Handling document in background for group: {group_id}")
-    if media_identifier.startswith("http"):
-        media_url = media_identifier
-    else:
-        media_url = whatsapp_service.get_media_url(media_identifier)
-        if not media_url:
-            logger.error(f"Could not get media URL for Meta media_id: {media_identifier}")
-            return
+    
     doc_id = str(uuid.uuid4())
-    file_extension = ".pdf" if "pdf" in mime_type else ".docx"
-    with tempfile.NamedTemporaryFile(delete=True, suffix=file_extension) as temp_file:
+    
+    with tempfile.NamedTemporaryFile(delete=True, suffix=".tmp") as temp_file:
         local_path = Path(temp_file.name)
-        download_successful = whatsapp_service.download_media(media_url, local_path)
-        if download_successful:
-            logger.info(f"Starting ingestion for document {doc_id} from group {group_id}")
-            rag_service.ingest_document(local_path, mime_type, group_id, doc_id)
+        
+        # 1. Download the media file
+        # The aliased whatsapp_service will call the correct download function
+        # for either Twilio or Meta.
+        success, suggested_filename = whatsapp_service.download_media(media_identifier, local_path, mime_type)
+        
+        if success:
+            # 2. Determine the best filename to use
+            # Priority 1: Filename explicitly sent in the message body/caption
+            original_filename = extract_filename_from_message(message_body) if PROVIDER == "twilio" else None
+            
+            if original_filename:
+                final_filename = original_filename
+            # Priority 2: Filename found in the download headers
+            elif suggested_filename:
+                final_filename = suggested_filename
+            # Priority 3: Generate a smart fallback name
+            else:
+                final_filename = generate_smart_filename(group_id, mime_type) if PROVIDER == "twilio" else f"documento_{doc_id}.pdf"
+
+            logger.info(f"Using filename: '{final_filename}' for ingestion.")
+
+            # 3. Start the ingestion process, passing the final filename
+            rag_service.ingest_document(
+                file_path=local_path,
+                mime_type=mime_type,
+                group_id=group_id,
+                doc_id=doc_id,
+                original_filename=final_filename # Pass the determined filename
+            )
         else:
             logger.error(f"Failed to download media from URL for group {group_id}")
 
+
 async def handle_text_message(question: str, group_id: str):
-    """New background task to handle question answering."""
+    """Handles question answering."""
     logger.info(f"Handling question in background for group: {group_id}")
-    
-    # 1. Get the answer from our RAG service
     answer = rag_service.answer_question(question, group_id)
-    
-    # 2. Send the answer back to the WhatsApp group
     whatsapp_service.send_whatsapp_message(to=group_id, message_text=answer)
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"--- Uvicorn starting up for provider: '{PROVIDER}' ---")
     uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True)
-
