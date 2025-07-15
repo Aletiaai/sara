@@ -230,7 +230,7 @@ def answer_question(question: str, group_id: str) -> str:
                 num_neighbors=5
             )
             neighbor_ids = [neighbor.id for r in neighbor_results for neighbor in r]
-            
+
             if not neighbor_ids:
                 return "Disculpa, la información que tengo no es suficiente para responder tu pregunta."
             
@@ -299,6 +299,8 @@ def answer_question(question: str, group_id: str) -> str:
 
         context = "\n\n---\n\n".join(context_parts)
         logger.info(f"Retrieved {len(context_parts)} final chunks for answer generation")
+        logger.info(f"Este es el contexto que recibe sara: \n------ start ------\n {context}\n------ end ------")
+
         
         final_answer = ask_llm(question, context)
         logger.info(f"Final answer generated successfully")
@@ -622,7 +624,9 @@ def filter_chunks_by_metadata(question: str, chunks_data: List[Dict], group_id: 
                     break
         
         # 2. Legal action type matching
-        legal_action_type = chunk.get('legal_action_type', '').lower()
+        legal_action_type = chunk.get('legal_action_type') or ''  # Get raw value
+        legal_action_type = legal_action_type.lower() if legal_action_type else ''  # Only call lower() if not None
+
         for action_type, keywords in legal_action_keywords.items():
             if any(keyword in question_lower for keyword in keywords):
                 if action_type in legal_action_type or any(keyword in legal_action_type for keyword in keywords):
